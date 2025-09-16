@@ -1,9 +1,9 @@
-use alloy_primitives::{Address, B256, FixedBytes};
+use alloy_primitives::{Address, FixedBytes, B256};
 use anyhow::{Context, Result};
+use op_succinct_client_utils::types::AggregationOutputs;
 use reqwest::Url;
 use serde::Serialize;
 use sp1_sdk::SP1VerifyingKey;
-use op_succinct_client_utils::types::AggregationOutputs;
 
 #[derive(Serialize)]
 struct SubmitReq {
@@ -71,7 +71,7 @@ pub async fn submit_to_publisher(
         .json(&body)
         .send()
         .await
-        .context("failed to submit to shared publisher")?;
+        .with_context(|| format!("failed to send request to publisher at {}", endpoint))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
