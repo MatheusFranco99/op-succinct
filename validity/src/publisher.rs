@@ -4,6 +4,7 @@ use op_succinct_client_utils::types::AggregationOutputs;
 use reqwest::Url;
 use serde::Serialize;
 use sp1_sdk::SP1VerifyingKey;
+use tracing::{debug, error, info};
 
 #[derive(Serialize)]
 struct SubmitReq {
@@ -52,6 +53,7 @@ pub async fn submit_to_publisher(
     agg_vk: &SP1VerifyingKey,
     proof_bytes: Option<&[u8]>,
 ) -> Result<()> {
+    debug!(endpoint = %endpoint, "Creating HTTP client for publisher request");
     let client = reqwest::Client::new();
 
     let body = SubmitReq {
@@ -66,12 +68,32 @@ pub async fn submit_to_publisher(
         proof: proof_bytes.map(|p| p.to_vec()),
     };
 
-    let resp = client
-        .post(endpoint.clone())
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("failed to send request to publisher at {}", endpoint))?;
+    let resp = client.post(endpoint.clone()).json(&body).send().await.map_err(|e| {
+        error!(
+            endpoint = %endpoint,
+            error = %e,
+            is_timeout = e.is_timeout(),
+            is_connect = e.is_connect(),
+            is_dns = e.to_string().contains("dns"),
+            "HTTP client request failed"
+        );
+
+        if e.is_timeout() {
+            anyhow::anyhow!("request timed out to publisher at {}", endpoint)
+        } else if e.is_connect() {
+            anyhow::anyhow!(
+                "connection failed to publisher at {} (service may be down or unreachable)",
+                endpoint
+            )
+        } else if e.to_string().contains("dns") {
+            anyhow::anyhow!(
+                "DNS resolution failed for publisher at {} (check hostname/service)",
+                endpoint
+            )
+        } else {
+            anyhow::anyhow!("failed to send request to publisher at {}: {}", endpoint, e)
+        }
+    })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
