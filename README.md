@@ -13,6 +13,11 @@ cd programs/aggregation
 cargo prove build
 ```
 
+To compile both programs at once from the workspace root:
+```bash
+cargo prove build -p range -p aggregation
+```
+
 To run my test:
 ```bash
 cd scripts/prove/tests
