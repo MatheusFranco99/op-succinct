@@ -16,7 +16,8 @@ use op_succinct_proof_utils::get_range_elf_embedded;
 use op_succinct_signer_utils::Signer;
 use sp1_sdk::{
     network::proto::types::{ExecutionStatus, FulfillmentStatus},
-    HashableKey, NetworkProver, Prover, ProverClient, SP1Proof, SP1ProofWithPublicValues,
+    HashableKey, NetworkProver, NetworkSigner, Prover, ProverClient, SP1Proof,
+    SP1ProofWithPublicValues,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -26,6 +27,7 @@ use crate::{
     find_gaps, get_latest_proposed_block_number, get_ranges_to_prove, CommitmentConfig,
     ContractConfig, OPSuccinctProofRequester, ProgramConfig, RequesterConfig, ValidityGauge,
 };
+use crate::publisher::{build_aggregation_outputs, submit_to_publisher};
 
 /// Configuration for the driver.
 pub struct DriverConfig {
@@ -34,6 +36,7 @@ pub struct DriverConfig {
     pub driver_db_client: Arc<DriverDBClient>,
     pub signer: Signer,
     pub loop_interval: u64,
+    pub publisher_url: Option<reqwest::Url>,
 }
 /// Type alias for a map of task IDs to their join handles and associated requests
 pub type TaskMap = HashMap<i64, (tokio::task::JoinHandle<Result<()>>, OPSuccinctRequest)>;
@@ -83,16 +86,26 @@ where
             .add_chain_lock(requester_config.l1_chain_id, requester_config.l2_chain_id)
             .await?;
 
-        // Set a default network private key to avoid an error in mock mode.
-        let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
-            tracing::warn!(
-                "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
-            );
-            "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
-        });
-
-        let network_prover =
-            Arc::new(ProverClient::builder().network().private_key(&private_key).build());
+        // Set up the network prover.
+        let network_prover = if requester_config.use_kms_requester {
+            // If using KMS, NETWORK_PRIVATE_KEY should be a KMS key ARN.
+            let kms_key_arn = env::var("NETWORK_PRIVATE_KEY")
+                .context("NETWORK_PRIVATE_KEY must be set when USE_KMS_REQUESTER is true")?;
+            let signer = NetworkSigner::aws_kms(&kms_key_arn).await?;
+            tracing::info!("Using KMS requester with address: {:?}", signer.address());
+            Arc::new(ProverClient::builder().network().signer(signer).build())
+        } else {
+            // Otherwise, use a private key with a default value to avoid errors in mock mode.
+            let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
+                );
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            });
+            let signer = NetworkSigner::local(&private_key)?;
+            tracing::info!("Using local requester with address: {:?}", signer.address());
+            Arc::new(ProverClient::builder().network().signer(signer).build())
+        };
 
         let (range_pk, range_vk) = network_prover.setup(get_range_elf_embedded());
 
@@ -128,6 +141,12 @@ where
             requester_config.agg_proof_strategy,
             requester_config.agg_proof_mode,
             requester_config.safe_db_fallback,
+            requester_config.max_price_per_pgu,
+            requester_config.timeout,
+            requester_config.range_cycle_limit,
+            requester_config.range_gas_limit,
+            requester_config.agg_cycle_limit,
+            requester_config.agg_gas_limit,
         ));
 
         let l2oo_contract =
@@ -136,6 +155,9 @@ where
         let dgf_contract =
             DisputeGameFactoryContract::new(requester_config.dgf_address, provider.clone());
 
+        // Read optional publisher URL directly from env to keep API stable.
+        let publisher_url = std::env::var("SHARED_PUBLISHER_URL").ok().and_then(|s| reqwest::Url::parse(&s).ok());
+
         let proposer = Proposer {
             driver_config: DriverConfig {
                 network_prover,
@@ -143,6 +165,7 @@ where
                 driver_db_client: db_client,
                 signer,
                 loop_interval,
+                publisher_url,
             },
             contract_config: ContractConfig {
                 l2oo_address: requester_config.l2oo_address,
@@ -898,6 +921,7 @@ where
     ///
     /// If the DGF address is set, use it to create a new validity dispute game that will resolve
     /// with the proof. Otherwise, propose the L2 output.
+    /// SSV: we do not submit on-chain; only to the Shared Publisher!!!
     async fn relay_aggregation_proof(
         &self,
         completed_agg_proof: &OPSuccinctRequest,
@@ -909,72 +933,66 @@ where
             .get_l2_output_at_block(completed_agg_proof.end_block as u64)
             .await?;
 
-        // If the DisputeGameFactory address is set, use it to create a new validity dispute game
-        // that will resolve with the proof. Note: In the DGF setting, the proof immediately
-        // resolves the game. Otherwise, propose the L2 output.
-        let receipt = if self.contract_config.dgf_address != Address::ZERO {
-            // Validity game type: https://github.com/ethereum-optimism/optimism/blob/develop/packages/contracts-bedrock/src/dispute/lib/Types.sol#L64.
-            const OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE: u32 = 6;
+        if let Some(publisher_url) = &self.driver_config.publisher_url {
+            let start_block = completed_agg_proof.start_block as u64;
+            let end_block = completed_agg_proof.end_block as u64;
 
-            // Get the initialization bond for the validity dispute game.
-            let init_bond = self
-                .contract_config
-                .dgf_contract
-                .initBonds(OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE)
-                .call()
+            let pre_output = self
+                .driver_config
+                .fetcher
+                .get_l2_output_at_block(start_block)
                 .await?;
+            let post_root_b256: B256 = output.output_root.0.into();
 
-            let transaction_request = self
-                .contract_config
-                .l2oo_contract
-                .dgfProposeL2Output(
-                    self.requester_config.op_succinct_config_name_hash,
-                    output.output_root,
-                    U256::from(completed_agg_proof.end_block),
-                    U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap()),
-                    completed_agg_proof.proof.as_ref().unwrap().clone().into(),
-                    self.requester_config.prover_address,
-                )
-                .value(init_bond)
-                .into_transaction_request();
+            let l1_head = B256::from_slice(
+                completed_agg_proof
+                    .checkpointed_l1_block_hash
+                    .as_ref()
+                    .expect("agg proof must have checkpointed l1 block hash"),
+            );
+            let agg_outputs = build_aggregation_outputs(
+                l1_head,
+                pre_output.output_root.0.into(),
+                post_root_b256,
+                end_block,
+                self.program_config.commitments.rollup_config_hash,
+                self.program_config.commitments.range_vkey_commitment,
+                self.requester_config.prover_address,
+            );
 
-            self.driver_config
-                .signer
-                .send_transaction_request(
-                    self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
-                    transaction_request,
-                )
-                .await?
-        } else {
-            // Propose the L2 output to the L2OutputOracle directly.
-            let transaction_request = self
-                .contract_config
-                .l2oo_contract
-                .proposeL2Output(
-                    self.requester_config.op_succinct_config_name_hash,
-                    output.output_root,
-                    U256::from(completed_agg_proof.end_block),
-                    U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap()),
-                    completed_agg_proof.proof.clone().unwrap().into(),
-                    self.requester_config.prover_address,
-                )
-                .into_transaction_request();
+            let superblock_hash = post_root_b256;
+            let l2_chain_id = self.requester_config.l2_chain_id as u32;
 
-            self.driver_config
-                .signer
-                .send_transaction_request(
-                    self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
-                    transaction_request,
-                )
-                .await?
-        };
-
-        // If the transaction reverted, log the error.
-        if !receipt.status() {
-            return Err(anyhow!("Transaction reverted: {:?}", receipt));
+            match submit_to_publisher(
+                publisher_url,
+                end_block,
+                superblock_hash,
+                l2_chain_id,
+                self.requester_config.prover_address,
+                l1_head,
+                agg_outputs,
+                start_block,
+                &self.program_config.agg_vk,
+                completed_agg_proof.proof.as_deref(),
+            )
+            .await
+            {
+                Ok(_) => info!(
+                    start_block,
+                    end_block,
+                    publisher = %publisher_url,
+                    "Published aggregation outputs to shared publisher"
+                ),
+                Err(e) => warn!(
+                    start_block,
+                    end_block,
+                    error = %e,
+                    "Failed to publish aggregation outputs; continuing"
+                ),
+            }
         }
-
-        Ok(receipt.transaction_hash())
+        
+        Ok(B256::ZERO) // Placeholder return value since we're not submitting on-chain
     }
 
     /// Validate the requester config matches the contract.

@@ -61,6 +61,28 @@ pub struct ProposerConfig {
     /// Maximum concurrent proving tasks allowed in fast finality mode.
     /// This limit prevents game creation when proving capacity is reached.
     pub fast_finality_proving_limit: u64,
+
+    /// Whether to to expect NETWORK_PRIVATE_KEY to be an AWS KMS key ARN instead of a
+    /// plaintext private key.
+    pub use_kms_requester: bool,
+
+    /// The maximum price per pgu for proving.
+    pub max_price_per_pgu: u64,
+
+    /// The timeout to use for proving (in seconds).
+    pub timeout: u64,
+
+    /// The cycle limit to use for range proofs.
+    pub range_cycle_limit: u64,
+
+    /// The gas limit to use for range proofs.
+    pub range_gas_limit: u64,
+
+    /// The cycle limit to use for aggregation proofs.
+    pub agg_cycle_limit: u64,
+
+    /// The gas limit to use for aggregation proofs.
+    pub agg_gas_limit: u64,
 }
 
 impl ProposerConfig {
@@ -98,6 +120,25 @@ impl ProposerConfig {
                 .parse()?,
             fast_finality_proving_limit: env::var("FAST_FINALITY_PROVING_LIMIT")
                 .unwrap_or("1".to_string())
+                .parse()?,
+            use_kms_requester: env::var("USE_KMS_REQUESTER")
+                .unwrap_or("false".to_string())
+                .parse()?,
+            max_price_per_pgu: env::var("MAX_PRICE_PER_PGU")
+                .unwrap_or("1000000000000".to_string()) // 1 PROVE per 1M PGUs
+                .parse()?,
+            timeout: env::var("TIMEOUT").unwrap_or("14400".to_string()).parse()?, // 4 hours
+            range_cycle_limit: env::var("RANGE_CYCLE_LIMIT")
+                .unwrap_or("1000000000000".to_string()) // 1 trillion
+                .parse()?,
+            range_gas_limit: env::var("RANGE_GAS_LIMIT")
+                .unwrap_or("1000000000000".to_string()) // 1 trillion
+                .parse()?,
+            agg_cycle_limit: env::var("AGG_CYCLE_LIMIT")
+                .unwrap_or("1000000000000".to_string()) // 1 trillion
+                .parse()?,
+            agg_gas_limit: env::var("AGG_GAS_LIMIT")
+                .unwrap_or("1000000000000".to_string()) // 1 trillion
                 .parse()?,
         })
     }

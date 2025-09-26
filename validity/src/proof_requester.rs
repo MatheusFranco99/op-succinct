@@ -12,8 +12,9 @@ use sp1_sdk::{
     network::{proto::types::ExecutionStatus, FulfillmentStrategy},
     NetworkProver, SP1Proof, SP1ProofMode, SP1ProofWithPublicValues, SP1Stdin, SP1_CIRCUIT_VERSION,
 };
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant, time::Duration};
 use tracing::{info, warn, Level};
+
 
 use crate::{
     db::DriverDBClient, OPSuccinctRequest, ProgramConfig, RequestExecutionStatistics,
@@ -31,6 +32,12 @@ pub struct OPSuccinctProofRequester<H: OPSuccinctHost> {
     pub agg_strategy: FulfillmentStrategy,
     pub agg_mode: SP1ProofMode,
     pub safe_db_fallback: bool,
+    pub max_price_per_pgu: u64,
+    pub timeout: u64,
+    pub range_cycle_limit: u64,
+    pub range_gas_limit: u64,
+    pub agg_cycle_limit: u64,
+    pub agg_gas_limit: u64,
 }
 
 impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
@@ -46,6 +53,12 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         agg_strategy: FulfillmentStrategy,
         agg_mode: SP1ProofMode,
         safe_db_fallback: bool,
+        max_price_per_pgu: u64,
+        timeout: u64,
+        range_cycle_limit: u64,
+        range_gas_limit: u64,
+        agg_cycle_limit: u64,
+        agg_gas_limit: u64,
     ) -> Self {
         Self {
             host,
@@ -58,6 +71,12 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
             agg_strategy,
             agg_mode,
             safe_db_fallback,
+            max_price_per_pgu,
+            timeout,
+            range_cycle_limit,
+            range_gas_limit,
+            agg_cycle_limit,
+            agg_gas_limit,
         }
     }
 
@@ -151,7 +170,11 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
             .compressed()
             .strategy(self.range_strategy)
             .skip_simulation(true)
-            .cycle_limit(1_000_000_000_000)
+            // TODO: implement feature flag.
+            .timeout(Duration::from_secs(self.timeout))
+            .max_price_per_pgu(self.max_price_per_pgu)
+            .cycle_limit(self.range_cycle_limit)
+            .gas_limit(self.range_gas_limit)
             .request_async()
             .await
         {
@@ -172,6 +195,11 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
             .prove(&self.program_config.agg_pk, &stdin)
             .mode(self.agg_mode)
             .strategy(self.agg_strategy)
+            // TODO: implement feature flag.
+            .timeout(Duration::from_secs(self.timeout))
+            .max_price_per_pgu(self.max_price_per_pgu)
+            .cycle_limit(self.agg_cycle_limit)
+            .gas_limit(self.agg_gas_limit)
             .request_async()
             .await
         {
